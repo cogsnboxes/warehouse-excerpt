@@ -1,0 +1,106 @@
+
+create or alter procedure dbo.identify_zkgu_personal_Persons
+	@data_deposit_id nvarchar(36),
+	@api_name nvarchar(30),
+	@overwrite_existing bit
+	with recompile, execute as 'warehouse_processing'
+as 
+begin
+	set nocount on;
+	declare @proc_version int = 1;
+	declare @report nvarchar(max);
+	declare @id nvarchar(36);
+	declare @PK_person nvarchar(36);
+
+	declare @resolved_count int=0;
+	declare @new_count int=0;
+	declare @error_count int=0;
+	declare @processed_row_count int = 0;
+
+	declare @record_json nvarchar(max);
+	declare @record_report nvarchar(max);
+
+	set @report =N'
+{
+	"general":{
+		"overwrite_existing":false,
+		"processed_count":0,
+		"new_count":0,
+		"resolved_count":0,
+		"error_count":0
+	},
+	"new":[],
+	"resolved":[],
+	"error":[]
+}
+	';
+
+	declare zkgu_records_cursor CURSOR for select id,pk_person from [STAGE_zkgu.personal] where deposit_id=@data_deposit_id order by ROW_NUM;
+	open zkgu_records_cursor;
+
+	fetch next from zkgu_records_cursor into @id,@PK_person;
+
+	while @@FETCH_STATUS = 0
+	begin
+
+		if @overwrite_existing = 1 or @PK_person = NULL
+		begin
+			set @record_json = (select top 1 * from [STAGE_zkgu.personal] where id=@id for json path, without_array_wrapper);
+			--print @record_json;
+			exec identify_zkgu_personal_Person @data_deposit_id=@data_deposit_id, @id=@id,@api_name='api_zkgu',@zkgu_record_json=@record_json,@report=@record_report output;
+			--print @record_report;
+			if JSON_VALUE(@record_report,N'$.status')=N'new'
+			begin
+				set @new_count = @new_count+1
+				set @report=JSON_MODIFY(@report,'append $.new',json_query(@record_report,'$.new'));
+			end
+			if JSON_VALUE(@record_report,N'$.status')=N'resolved'
+			begin
+				set @resolved_count = @resolved_count+1
+				set @report=JSON_MODIFY(@report,'append $.resolved',json_query(@record_report,'$.resolved'));
+			end
+			if JSON_VALUE(@record_report,N'$.status')=N'error'
+			begin
+				set @error_count = @error_count+1
+				set @report=JSON_MODIFY(@report,'append $.error',json_query(@record_report,'$.error'));
+			end
+
+			set @processed_row_count = @processed_row_count+1;
+
+			--if @processed_row_count > 5 break;
+
+		end;
+		fetch next from zkgu_records_cursor into @id,@PK_person;
+	end;
+
+	set @report = JSON_MODIFY(@report,'$.general.processed_count',@processed_row_count);
+	set @report = JSON_MODIFY(@report,'$.general.new_count',@new_count);
+	set	@report = JSON_MODIFY(@report,'$.general.resolved_count',@resolved_count);
+	set @report = JSON_MODIFY(@report,'$.general.error_count',@error_count);
+
+	close zkgu_records_cursor;
+	deallocate zkgu_records_cursor;
+
+	insert into deposit_allocation_reports(
+		data_deposit_id, 
+		processing_stage_id,
+		api_name,
+		row_count,
+		erroneous_row_count,
+		outcome,
+		extra_info,
+		proc_version,
+		proc_name
+	) values (
+		@data_deposit_id,
+		5,
+		@api_name,
+		json_value(@report,'$.general.processed_count'),
+		json_value(@report,'$.general.error_count'),
+		1,
+		@report,
+		@proc_version,
+		'identify_zkgu_personal_Persons'
+	);
+	set nocount off;
+end;

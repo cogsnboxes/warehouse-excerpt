@@ -1,0 +1,309 @@
+USE [warehouse]
+GO
+
+/****** Object:  StoredProcedure [dbo].[identify_zkgu_personal_Person]    Script Date: 10.02.2022 16:01:02 ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+create or alter procedure [dbo].[identify_zkgu_personal_Person]
+	@data_deposit_id nvarchar(36),
+	@id nvarchar(36),
+	@api_name nvarchar(30),
+	@zkgu_record_json nvarchar(max),
+	@report nvarchar(max) output
+	with recompile, execute as 'warehouse_processing'
+as 
+begin
+	--set @report=N'AAA';
+	--select @report;
+	--return;
+	--declare @zkgu_record_json nvarchar(max)=(select top 1 * from [STAGE_zkgu.personal] for json path, without_array_wrapper);
+
+	--declare @report nvarchar(max);
+	--declare @data_deposit_id nvarchar(36)=N'741014DD-FE14-45EC-8C08-7E9C91FB281C';
+
+	/*
+		1. get all records from stage_zkgu.personal where deposit_id=@data_deposit_id and pk_person is null
+		2. for each record, call python script and pass person attributes as well as all link_person records where source_name is zkgu.personal
+	*/
+	declare @py_report nvarchar(max);
+	declare @pk nvarchar(36);
+	EXECUTE sp_execute_external_script 
+		  @language = N'Python'
+		, @script = N'
+
+import json
+import math
+zkgu_record_dict=json.loads(zkgu_record_json)
+fields_search_order=["СНИЛС", "Сотрудник.Физическое лицо.Служебный адрес электронной почты", "Должность"]
+
+py_report = {
+	"status":"", #"resolved","new","error"
+	"resolved":{
+		"pk":"",
+		"link_id":"",
+		"factors_count":0,
+		"factors":[]
+	},
+	"new":{
+		"name":"",
+		"links":[] #{"link_field":"","link_value"}
+	},
+	"error":{
+		"code":"",
+		"title":"",
+		"details":{}
+	},
+}
+
+#------------------------
+for item in ["id","PK_person","link_field","link_value","next_link","is_root"]:
+	if item not in links.columns:
+		links.insert(0,item,None)
+		
+def get_links(links_source, search_field, search_value):
+	#print("def get_links(",search_field,",",search_value,")")
+	result_list = []
+	result_list = links_source.query("is_root==True").query("link_field==\""+search_field+"\"").query("link_value==\""+search_value+"\"").to_dict("list")["id"]
+	return result_list
+
+def chain_link(links_source,link_id,result_list=None):
+	if not result_list: result_list = list()
+	links_search=links_source.query("id=="+str(link_id)).to_dict("records")
+	if len(links_search) == 0:#next_link_id with NULL value is converted as a negative number, doesnt get caught as null and yields empty search result
+		return result_list
+	link_data=links_search[0]
+	result_list.append({"link_field":link_data["link_field"], "link_value":link_data["link_value"]})
+	if link_data["next_link_id"]==None or math.isnan(link_data["next_link_id"]):
+		return result_list
+	else:
+		return chain_link(links_source, link_data["next_link_id"], result_list)
+
+def chain_links(links_source,link_ids):
+	#print("def chain_links(",link_ids,")")
+	result_list = []
+	for link_id in link_ids:
+		#print("PK_person:",links_source.query("id=="+str(link_id)).to_dict("records"))
+		PK_person = links_source.query("id=="+str(link_id)).to_dict("records")[0]["PK_person"]
+		result_list.append({"id":link_id, "PK_person":PK_person, "links":chain_link(links_source,link_id)})
+	return result_list
+
+def check_links(links_list,record):
+	#print("def check_links")
+	result_dict = dict()
+	
+	for link_variant in links_list: #{"id","PK_person","links"["link_field","link_value"]}
+		#print("link_variant:",link_variant)
+		PK_person = link_variant["PK_person"]
+		variant_outcome = True
+		
+		for link_piece in link_variant["links"]:
+			if link_piece["link_field"] not in record.keys():
+				print(link_piece["link_field"],"not in",record.keys())
+				variant_outcome = False
+				break
+			if link_piece["link_value"] != record[link_piece["link_field"]]:
+				variant_outcome = False
+				break
+		#print("variant_outcome=",variant_outcome)
+		if variant_outcome == False: continue
+		
+		if PK_person not in result_dict.keys(): result_dict[PK_person] = []
+
+		result_dict[PK_person].append({"id":link_variant["id"], "links": link_variant["links"]})
+	#print("end def check_links")
+
+	return result_dict	
+
+def report_found_link(links_checked):
+	#print("Found a single match:",links_checked)
+	py_report["status"] = "resolved"
+	pk = list(links_checked.keys())[0]
+	py_report["resolved"]["pk"] = pk
+	py_report["resolved"]["link_id"] = links_checked[pk][0]["id"]
+	py_report["resolved"]["factors_count"] = len(links_checked[pk][0]["links"])
+	py_report["resolved"]["factors"] = links_checked[pk][0]["links"]
+
+def report_multiple_positives(links_checked):
+	pk = None
+	py_report["status"] = "error"
+
+	#print("Found multiple matches, error!:",links_checked)
+	py_report["error"]["code"]="duplicates"
+	py_report["error"]["title"]="Множественные совпадения"
+	py_report["error"]["details"]=links_checked
+
+def report_new_link(name, links):
+	pk=None
+	py_report["status"] = "new"
+	py_report["new"]["name"] = name
+	py_report["new"]["links"]=links
+	#print("New link suggested:", name, links)
+
+
+def report_new_link_problem(record):
+	pass
+	#print("Unable to make a new link for a record:",record)
+
+def add_new_link(links_list, search_fields, record):
+	#print("def add_new_link")
+	result = []
+	alternative_variants = []
+	links_filtered = get_links(links_list,search_fields[0],record[search_fields[0]])
+	links_list = chain_links(links_list,links_filtered)
+	#for each links_list item, make a variant of record description that does not match the item
+	#choose the shortest variant
+	#print("checking links_list:",links_list)
+	if len(links_list) == 0:
+		return [{"link_field":search_fields[0], "link_value":record[search_fields[0]]}]
+	variants = []
+	for chain in links_list:
+		chain_variant = []
+		for element in chain["links"]:
+			chain_variant.append(element["link_field"])
+			if record[element["link_field"]] != element["link_value"]:
+				break
+		variants.append(chain_variant)
+	#print("chain variants:",variants)
+	merged_variants = []
+	for item in variants:
+		is_not_a_subset = True
+		for subitem in variants:
+			if subitem == item: continue
+			if set(item).issubset(set(subitem)):
+				is_not_a_subset = False
+				break
+		if is_not_a_subset:
+			merged_variants.append(item)
+	#print("merged_variants:",merged_variants)
+	shortest_variant = [0,0,0,0,0,0,0,0,0,0]
+	for item in merged_variants:
+		if len(item) < len(shortest_variant):
+			shortest_variant = item
+	result = []
+	for item in shortest_variant:
+		result.append({"link_field":item,"link_value":record[item]})
+	return result
+		
+search_fields = ["СНИЛС", "Сотрудник_Физическое лицо_Служебный адрес электронной почты", "Должность"]
+name_field = "Сотрудник"
+
+record=zkgu_record_dict
+name=record[name_field]
+found=False
+for search_field in search_fields:
+	if search_field not in record: continue
+	#print("[search_field",search_field,"]")
+	field_value = record[search_field]
+	links_filtered = get_links(links,search_field,field_value) # [L1,L2,L3]
+	#print("links filtered",links_filtered)
+	links_list = chain_links(links,links_filtered) # [{L1[X,Y]},{L2[X]},{L3[X,Z,T]}]
+	#print("links_list",links_list)
+	links_checked = check_links(links_list, record) # {PK1 [{L1[X,Y]},{L3[X,Z,T]}] }
+	#print("links_checked",links_checked)
+	
+	if len(links_checked.keys()) == 1: 
+		report_found_link(links_checked)
+		found = True
+		break
+	if len(links_checked.keys()) > 1: 
+		report_multiple_positives(links_checked)
+		found = True
+		break
+	if len(links_checked.keys()) == 0: continue
+
+	
+if not found:#report["status"] == "":
+	links=add_new_link(links, search_fields, record) #[{X=1}, {Y=2}, {T=3}]
+	if len(links) > 0:
+		report_new_link(name,links)
+	else:
+		report_new_link_problem(record)
+
+#print(identify(links,zkgu_record_dict,fields_search_order))
+py_report=json.dumps(py_report,ensure_ascii=False).encode("utf-8")
+		'
+		, @input_data_1 = N'select id, PK_person, source_name, link_field, link_value, next_link_id,is_root from LINK_person'-- where source_name=N''zkgu.personal'''
+		, @input_data_1_name = N'links'
+		, @params = N'@py_report nvarchar(max) OUTPUT, @pk nvarchar(36) OUTPUT,@zkgu_record_json nvarchar(max)'
+		, @py_report=@py_report OUTPUT
+		, @pk=@pk OUTPUT
+		, @zkgu_record_json=@zkgu_record_json;
+
+	declare @PK_person nvarchar(36);
+	DECLARE @OutputTbl TABLE (ID nvarchar(36));
+	set nocount on;
+	if JSON_VALUE(@py_report,'$.status'	) = 'new' 
+	begin
+
+		--ENTYTY_person
+		
+		insert into ENTITY_person(name) 
+			output inserted.PK_person into @OutputTbl 
+			values(json_value(@py_report,'$.new.name'));
+		set @PK_person = (select top 1 ID from @OutputTbl);
+
+		
+		set @py_report = json_modify(@py_report,'$.new.pk',cast(@pk_person as nvarchar(36)));
+
+		--LINK_person
+		
+		declare links cursor for 
+			select link_field,link_value from openjson(@py_report,'$.new.links') with (link_field nvarchar(250), link_value nvarchar(250));
+		open links;
+		declare @link_field nvarchar(250);
+		declare @link_value nvarchar(250);
+		declare @LinkIdTable TABLE (ID int);
+		declare @is_root bit=1;
+		declare @previous_id int;
+		declare @current_id int;
+
+		fetch next from links into @link_field,@link_value;
+		while @@FETCH_STATUS=0
+		begin
+			insert into LINK_person(PK_person,source_name, link_field,link_value,data_deposit_id,is_root,next_link_id)
+				output inserted.id into @LinkIdTable
+				values(@PK_person, @api_name,@link_field,@link_value,@data_deposit_id,@is_root,NULL);
+			set @current_id = (select top 1 id from @LinkIdTable);
+			delete from @LinkIdTable;
+			if @is_root = 0 --not first, should update next_link_id in previously inserted
+			begin
+				update LINK_person set next_link_id=@current_id where id=@previous_id;
+			end
+
+			set @is_root = 0;
+			set @previous_id = @current_id;--(select top 1 id from @LinkIdTable);
+			--delete from @LinkIdTable;
+			fetch next from links into @link_field,@link_value;
+			--print @link_field+'='+@link_value;
+		end;
+		close links;
+		deallocate links;
+
+		--STAGE_zkgu
+		update [STAGE_zkgu.personal] set PK_person = @PK_person where id=@id;
+		set @py_report = json_modify(@py_report,'$.new.id',@id);
+	end
+
+	if JSON_VALUE(@py_report,'$.status'	) = 'resolved' 
+	begin
+		--write to STAGE_zkgu
+
+		set @PK_person = json_value(@py_report,N'$.resolved.pk');
+		update [STAGE_zkgu.personal] set PK_person=@PK_person where id=@id;
+
+	end
+
+	set @report = @py_report;
+	set nocount off;
+
+	return;
+end
+
+GO
+
+
